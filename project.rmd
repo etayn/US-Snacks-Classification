@@ -1,0 +1,956 @@
+---
+title: "Final Project - EDA"
+author: "Etay Nahum - 313163735"
+output:
+  pdf_document: default
+---
+
+```{r, message=FALSE , warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(ggplot2)
+library(tidytext)
+library(rpart)
+library(glmnet)
+library(reticulate)
+library(xgboost)
+library(kknn)
+library(randomForest)
+library(purrr)
+```
+
+```{python , message = FALSE}
+import pandas as pd
+import numpy as np
+import os
+from matplotlib.image import imread
+import warnings
+```
+
+
+##  Reading and Uniting the Data
+
+```{r , message=FALSE}
+food_train <- read_csv("food_train.csv")
+food_test <- read_csv("food_test.csv")
+food_nutrients <- read_csv("food_nutrients.csv")
+nutrients <- read_csv("nutrients.csv")
+```
+
+* I united the food nutrients and the nutrients datasets,
+  changed the dataset to wide so each nutrient have it's own column so 
+  i can unite it with the doof train dataset.
+* Unite the train and test datasets with the final nutrients datasets by idx.
+* Saved the columns in "cols_with_NA" that have over 80% NA , before changing
+  those NA into 0 in the test and train sets (the assumption is that a nutrients
+  with NA suggesting that there isn't this nutrient in the snack).
+* Changing ml to g (there are that same)
+
+```{r , message=FALSE , warning=FALSE}
+full_nut_data <- full_join(food_nutrients , nutrients) %>% 
+  select(idx , amount , name)
+
+full_nut_data <- full_nut_data %>% 
+  pivot_wider(id_cols = 1 , 
+              values_from = amount , names_from = name , values_fn = mean)
+
+index_for_train <- food_train %>% 
+  pull(idx)
+index_for_test <- food_test %>% 
+  pull(idx)
+
+final_train <- full_join(food_train , full_nut_data[index_for_train ,])
+final_test <- full_join(food_test , full_nut_data[index_for_test ,])
+
+cols_with_NA <- final_train[,((colSums(is.na(final_train)))/nrow(final_train)) > 0.8]
+
+final_train <- final_train %>% 
+  mutate(across(is.numeric , ~replace_na(.x , 0))) %>% 
+  mutate(serving_size_unit = ifelse(serving_size_unit == "ml" , "g" , "g"))
+
+final_test <- final_test %>% 
+  mutate(across(is.numeric , ~replace_na(.x , 0))) %>% 
+  mutate(serving_size_unit = ifelse(serving_size_unit == "ml" , "g" , "g"))
+```
+
+## NA Features
+
+* Checking if the columns with NA have a pattern/significance in each category.
+  for this i calculated for each category the mean percentage that those columns 
+  have a positive value and not zero.
+
+
+```{r , echo=FALSE}
+cols_with_NA <- bind_cols(cols_with_NA , final_train %>% select(category))
+
+cols_with_NA <- cols_with_NA %>% 
+  mutate(across(is.numeric , ~replace_na(.x , 0))) %>% 
+  mutate(across(is.numeric , ~ifelse(.x > 0 , 1 , 0)))
+
+cols_with_NA <- cols_with_NA %>% 
+  mutate(sum_of_rows = rowSums(across(is.numeric))/(ncol(cols_with_NA)-1))
+
+cols_with_NA %>% 
+  group_by(category) %>% 
+  summarise(perc = mean(sum_of_rows)) %>% 
+  arrange(-perc)
+```
+
+* As we can see for all the categories we have very small percentage of positives
+  values in those columns,and we don't have a very big difference between the categories,
+  thus we will not use them in the prediction section.
+
+## EDA on Nominal Features  
+
+### household_serving_fulltext Feature
+  
+* Checking difference in the serving unit for each category
+  with the household_serving_fulltext feature.
+* After studying this feature, checking which unit shows up most, and checking 
+  errors in the spelling and other variations of spelling for the same unit.
+  
+```{r}
+strings <- c("onz","cookie","piece","slice","chip" , "cracker" , "cup" ,
+             "cake" , "pretzel" ,"pop" ,"square" , "bag","pouch", "package" ,
+            "bar" , "brownie" ,  "tbsp" , "donut" ,"piece" , "grm" )
+
+serving_text <- final_train %>% 
+  select(household_serving_fulltext , category) %>% 
+  mutate(text_units = gsub('[[:digit:]]+' , '' , household_serving_fulltext)) %>% 
+  mutate(text_units = gsub('\\.+' , '' , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"onz") , "onz" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units
+                                        ,"cookie|cookeis|cookes|ckooies|cooikes|coookie"),
+                             "cookie" , text_units)) %>%
+  mutate(text_units = ifelse(str_detect(text_units ,"piece|pcs") , "piece" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"slice") , "slice" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"chip") , "chip" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"cracker") , "cracker" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"cup") , "cup" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"cake") , "cake" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"pretzel|petzels") , "pretzel" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"pop") , "pop" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"square") , "square" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"bag") , "bag" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"pouch") , "pouch" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"package|pkg|pack") , "package" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"bar") , "bar" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"brownie") , "brownie" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"tbsp") , "tbsp" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"donut") , "donut" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units ,"piece") , "piece" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units , "grm") , "grm" , text_units)) %>% 
+  mutate(text_units = ifelse(str_detect(text_units , paste(strings , collapse = "|")) ,
+                                        text_units , "other"))
+```
+
+
+```{r , echo=FALSE}
+ggplot(serving_text , aes(x = text_units)) +
+  geom_bar() +
+  facet_wrap(vars(category)) + 
+  theme(axis.text.x = element_text(angle = 90 , vjust = 0.4 ,hjust = 1 , size = 8)) +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    x = "Serving Unit",
+    title = "Serving Unit Per Category"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major.y = element_blank() ,
+        panel.grid.minor.y = element_blank())
+```
+
+* We can see that cakes_cupcakes_snack_cakes category is pretty diverse, 
+  chocolate is mainly "piece" and "bar" , candy is mostly "piece" , 
+  cookies_biscuits is mostly "cookie" , chips_pretzels_snacks is mostly "onz", 
+  and popcorn_peanuts_seeds_related_snacks is mainly "cup" and "onz".
+  This information will help us in the prediction section.
+
+### Description Feature
+
+* Checking if the description contains the name of the category.
+
+```{r}
+desc_func <- function(cate){
+  pat <- gsub('\\_+' , '|' , cate)
+  new <- final_train %>% 
+    filter(category == cate) %>% 
+    select(category , description) %>% 
+    mutate(include = ifelse(str_detect(description ,pat) , "Yes" , "No")) %>% 
+    select(include , category)
+  return(new)
+}
+
+cate_vec <- final_train %>% 
+  select(category) %>% 
+  unique() %>% 
+  pull()
+
+desc_data <- map_dfr(cate_vec , desc_func)
+```
+
+```{r ,echo=FALSE}
+ggplot(desc_data , aes(fill = category , x = include)) +
+  geom_bar(position = "dodge") +
+  labs(
+    title = "Does Description Include The Category",
+    x = "Include"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* We can see that for chips_pretzels_snacks, chocolate and cookies_biscuits
+  most of the descriptions does contain the name of the category,
+  and for the other three most of them are not. 
+  This will further help us in the prediction section.
+  
+### Ingredients Feature
+
+* Checking for differences in ingredients for each category by
+  taking the top 15 words in ingredients for each category.
+  
+```{r}
+func_for_ing <- function(cate){ 
+  top_word <- final_train %>% 
+  filter(category == cate) %>% 
+  select(ingredients) %>% 
+  unnest_tokens(word , ingredients) %>% 
+  count(word) %>% 
+  filter(str_detect(word , "[a-z]")) %>% 
+  arrange(-n) %>% 
+  slice_head(n = 15) %>% 
+  add_column(category = rep(cate , 15))
+  return(top_word)
+}
+```
+
+```{r}
+ing_df <- map_dfr(cate_vec , func_for_ing)
+final_ing_df <- tibble("chocolate" = ing_df[1:15,1] %>% pull() ,
+                       "cookies_biscuits" = ing_df[16:30,1] %>% pull() ,
+                       "cakes_cupcakes_snack_cakes" = ing_df[31:45,1]%>% pull() ,
+                       "candy" = ing_df[46:60 , 1]%>% pull() ,
+                       "chips_pretzels_snacks" = ing_df[61:75,1]%>% pull(),
+                       "popcorn_peanuts_seeds_related_snacks" = ing_df[76:90,1]%>% pull())
+
+final_ing_df
+```
+
+* Unique (mostly) ingredients:
+* chocolate - milk , cocoa , butter , chocolate , emulsifier , vanilla
+* cookies_biscuits - wheat , palm , syrup
+* cakes_cupcakes_snack_cakes - sodium , gum , starch , water
+* candy - yellow , red , blue , citric
+* chips_pretzels_snacks - sunflower , canola , organic , vegetable
+* popcorn_peanuts_seeds_related_snacks - almonds , sunflower
+
+* Checking the amount of the ingredients of each category by calculating the
+  length and the number of words for each category.
+  
+```{r}
+length_ing <- final_train %>% 
+  select(ingredients , category) %>% 
+  mutate(len_ing = str_length(ingredients)) %>% 
+  mutate(num_word = str_count(ingredients , "\\w+"))
+```
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(length_ing , aes(x = len_ing , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  xlim(c(0 , 1100)) +
+  theme(legend.position = "none") +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Length of Ingredients Per Category" ,
+    x = "Length"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r ,echo=FALSE , warning=FALSE}
+ggplot(length_ing , aes(x = num_word , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  xlim(c(0 , 200)) +
+  theme(legend.position = "none") +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Number of Words For Ingredients Per Category" ,
+    x = "Number of Words"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* For both metrics we can see that cakes_cupcakes_snack_cakes category is
+  larger than the rest, followed by cookies_biscuits category, 
+  and have a distribution that resembles the normal distribution.
+* For the other four, we can see right tail , suggesting we should apply 
+  log transformation for the two metrics.
+
+### brand feature
+
+* Checking the top 10 brands and adn filtering only with categories that
+  those brand shows up more than 100 times.
+  
+```{r}
+brand_data <- final_train %>% 
+  group_by(category , brand) %>% 
+  count(brand) %>% 
+  arrange(-n)
+
+brand_vec <- brand_data %>% 
+  select(brand) %>%  
+  pull()
+
+brand_data <- brand_data %>% 
+  filter(brand %in% brand_vec[1:10]) %>% 
+  filter(n > 100)
+
+brand_data
+```
+* We can see that there are brands that shows up more for specific category, 
+  like the ferrara candy company for candy category and meijer for popcorn.
+
+
+## EDA on Numeric features
+
+* For this section we will focus on the serving size feature , and on the four
+  most common nutrients we will check when buying a snack - energy, protein,
+  fat saturated  and sodium.
+  
+### energy
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(final_train,aes(x=Energy , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  theme(legend.position = "none") +
+  xlim(c(150 , 700)) +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Energy Density Per Category"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+* We can see that popcorn_peanuts_seeds_related_snacks category has
+  the highest energy, followed by chips_pretzels_snacks.
+* cakes_cupcakes_snack_cakes and candy about the same, 
+  chocolate and cookies_biscuits about the same.
+
+### protein
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(final_train,aes(x=Protein , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  theme(legend.position = "none") +
+  xlim(c(0,30)) +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Protein Density Per Category"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* popcorn_peanuts_seeds_related_snacks has the highest protein ,
+  while the other four expect for candy are about the same.
+
+### sodium
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(final_train ,aes(x = `Sodium, Na` , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  xlim(c(0,1500)) +
+  theme(legend.position = "none") +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Sodium Density Per Category" ,
+    x = "Sodium"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* chips_pretzels_snacks has the highest sodium , and the other four
+  are lower but with different distribution.
+
+### fat, saturated
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(final_train ,aes(x=`Fatty acids, total saturated` , col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  theme(legend.position = "none") +
+  xlim(c(0,30)) +
+  theme(strip.text = element_text(size = 7))+
+  labs(
+    title = "Saturated Fat Density Per Category" ,
+    x = "Saturated Fat"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* chocolate has the highest fat, candy the lowest and the other four 
+  are about the same.
+
+### serving size
+
+```{r , echo=FALSE , warning=FALSE}
+ggplot(final_train ,aes(x=serving_size, col = category)) +
+  geom_density() +
+  facet_wrap(vars(category)) +
+  theme(legend.position = "none") +
+  xlim(c(0,70)) +
+  theme(strip.text = element_text(size = 7))+
+  labs(
+    title = "Serving Size Density Per Category" ,
+    x = "Serving Size"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* cakes_cupcakes_snack_cakes has the highest serving size,
+  chips_pretzels_snacks is very concentrated in about the 30 size.
+  
+
+## EDA on Image data
+
+* My goal was to check if there is difference in the colors of the snacks
+  packages, for this i calculated the mean of each rgb channel.
+* Note - because most of the pictures have white background, the results are
+  skewed upwards, but my assumption is that the order between the categories 
+  remain the same.
+* Note - all of the python chunks were written in R markdown, the warning filter
+  in those chunks is there because i had some "futurewarning", basically telling
+  that append is going to be replaced with concat, warnings of that nature.
+
+```{python}
+warnings.filterwarnings('ignore')
+dir = os.listdir("C:/Users/itay/train")
+df_img = pd.DataFrame()
+```
+
+* Function that takes the mean of each rgb channel and the index for every pic.
+
+```{python}
+warnings.filterwarnings('ignore')
+def img_func(img_path):
+  idx = os.path.basename(img_path)
+  idx = idx.split(".")[0]
+  image = imread(img_path)
+  red = image[:,:,0].flatten()
+  green = image[:,:,1].flatten()
+  blue = image[:,:,2].flatten()
+  red = np.mean(red)
+  green = np.mean(green)
+  blue = np.mean(blue)
+  dict = {"idx" : idx , "red" : red , "green" : green , "blue" : blue}
+  return(dict)
+```
+
+* Looping through all the training pics.
+
+```{python , message = F , warning = F , error = F}
+warnings.filterwarnings('ignore')
+for directory in dir:
+  sub_dir = "C:/Users/itay/train/" + directory
+  sub_dir_enter = os.listdir(sub_dir)
+  for image in sub_dir_enter:
+    img = sub_dir + "/" + image
+    temp_df = img_func(img)
+    df_img = df_img.append(temp_df , ignore_index = True)
+```
+
+```{python}
+warnings.filterwarnings('ignore')
+print(df_img.shape)
+```
+* joining the pics DF with the training dataset.
+
+```{r}
+data_images <- tibble(py$df_img)
+
+data_images$idx <- as.numeric(data_images$idx)
+
+final_train <- full_join(final_train , data_images , by = "idx")
+```
+
+
+```{r , echo=FALSE}
+ggplot(final_train,aes(x=red)) +
+  geom_density(aes(col = "red")) +
+  geom_density(aes(x = blue , col = "blue"))+
+  geom_density(aes(x = green , col = "green"))+
+  facet_wrap(vars(category)) +
+  theme(legend.position = "none") +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Mean rgb channels Density Per Category" ,
+    x = "Colors"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+* We can see for all the categories that blue is dominant, other than that
+  there is no additional information that can help us in the prediction.
+
+
+###################################################################
+
+---
+title: "Final Project - Classification"
+author: "Etay Nahum - 313163735"
+output: pdf_document
+---
+
+# Strategy
+
+## preproccessing
+
+* First i removed the variables (nutrients) with large number of NA (cols_with_NA table from before),
+  removed the red,blue,yellow featured from the images, and finally removed the 
+  serving size unit feature.
+* The main goal is to make the data all numeric and normalize so i can use different models.
+* I used the information i got from the EDA in order to make mostly dummy variables 
+  based on the nominal variables.
+* For ingredients i made dummy variable based on unique ingredient for each category,
+  plus made length and number of word based on the ingredients variable and applied
+  log transformation.
+* For brand i did the same, mostly for the most appearance brands.
+* For description i made dummy variable if the description contains the name of
+  the category.
+* For household_serving_fulltext i made dummy variable based on the type of serving,
+  as i presented in the first graph.
+* For all the other nutrients variables i applied normalization.
+* replaced NA with 0, if nutrients was with NA the logical assumption that is zero,
+  and for the new dummy variables the same logic is applied.
+
+
+## Models
+
+* I split the training data into train_train and train_val.
+* For the train_train data, i used CV with 5 folds to tune hyper parameters
+  for the next 4 models:
+  1 - multinom regression: tuned penalty and mixture.
+  2 - knn model: tuned number of neighbors and the distance power.
+  3 - xgboost: tuned learning rate, number of tree and trees depth.
+  4 - random forest: tuned number of trees and number of feature to be taken
+      each tree.
+      
+* After tuning and taking the best hyper parameters for each model, i fit them
+  with those parameters on the entire train_train data and compare their accuracy
+  on the train_val data, and takes the best performing model.
+
+
+### Splitting training data 
+
+
+```{r}
+set.seed(77)
+split_obj <- initial_split(final_train , 0.8  , strata = category)
+train_train <- training(split_obj)
+train_val <- testing(split_obj)
+```
+
+### The recipe
+
+```{r}
+cols_NA_for_rec <- cols_with_NA %>% 
+  select(-category , -sum_of_rows) %>% 
+  colnames() 
+
+rec <- recipe(category~. , train_train) %>%
+  update_role(idx , new_role = "ID") %>% 
+  step_rm(all_of(cols_NA_for_rec) ,serving_size_unit , red , blue , green) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_mutate(len_ing = str_length(ingredients)) %>% 
+  step_mutate(n_word_ing = str_count(ingredients , "\\w+")) %>%
+  step_mutate(brand_ferrara = str_detect(brand , "ferrara")) %>%
+  step_mutate(brand_walmart = str_detect(brand , "wal-mart")) %>%
+  step_mutate(brand_meijer = str_detect(brand , "meijer"))%>%
+  step_mutate(brand_target = str_detect(brand , "target stores"))%>%
+  step_mutate(brand_lindt = str_detect(brand , "lindt")) %>%
+  step_mutate(brand_russel = str_detect(brand , "russell stores")) %>%
+  step_mutate(brand_quality = str_detect(brand , "quality foods")) %>%
+  step_mutate(brand_frankford = str_detect(brand , "frankford")) %>%
+  step_mutate(brand_not = str_detect(brand , "not a")) %>%
+  step_mutate(brand_nabisco = str_detect(brand , "nabisco")) %>%
+  step_mutate(description_chocolate = str_detect(description , "chocolate")) %>%
+  step_mutate(description_cookie = str_detect(description , "cookie|biscuit")) %>%
+  step_mutate(description_cake = str_detect(description , "cake|cupcake")) %>%
+  step_mutate(description_candy = str_detect(description , "candy"))%>%
+  step_mutate(description_chips = str_detect(description , "chips|pretzel")) %>%
+  step_mutate(description_pop_peanut = str_detect(description , "popcorn|peanut|seed")) %>%
+  step_mutate(ingredients_milk = str_detect(ingredients , "milk"))%>% 
+  step_mutate(ingredients_cocoa = str_detect(ingredients , "cocoa")) %>% 
+  step_mutate(ingredients_chocolate = str_detect(ingredients , "chocolate")) %>% 
+  step_mutate(ingredients_butter = str_detect(ingredients , "butter")) %>% 
+  step_mutate(ingredients_emuls = str_detect(ingredients , "emulsifier")) %>% 
+  step_mutate(ingredients_vanilla = str_detect(ingredients , "vanilla")) %>% 
+  step_mutate(ingredients_wheat = str_detect(ingredients , "wheat")) %>%
+  step_mutate(ingredients_palm = str_detect(ingredients , "palm")) %>%
+  step_mutate(ingredients_syrup = str_detect(ingredients , "syrup")) %>%
+  step_mutate(ingredients_soduim = str_detect(ingredients , "sodium")) %>%
+  step_mutate(ingredients_gum = str_detect(ingredients , "gum")) %>%
+  step_mutate(ingredients_starch = str_detect(ingredients , "starch")) %>%
+  step_mutate(ingredients_water = str_detect(ingredients , "water")) %>%
+  step_mutate(ingredients_yellow = str_detect(ingredients , "yellow")) %>%
+  step_mutate(ingredients_red = str_detect(ingredients , "red"))%>%
+  step_mutate(ingredients_blue = str_detect(ingredients , "blue")) %>%
+  step_mutate(ingredients_citric = str_detect(ingredients , "citric")) %>%
+  step_mutate(ingredients_sunflower = str_detect(ingredients , "sunflower")) %>%
+  step_mutate(ingredients_canola = str_detect(ingredients , "canola")) %>%
+  step_mutate(ingredients_organic = str_detect(ingredients , "organic")) %>%
+  step_mutate(ingredients_veg = str_detect(ingredients , "vegetable")) %>%
+  step_mutate(ingredients_almond = str_detect(ingredients , "almond")) %>%
+  step_mutate(household_serving_fulltext_bag = str_detect(household_serving_fulltext,"bag"))%>%
+  step_mutate(household_serving_fulltext_bar = str_detect(household_serving_fulltext,
+                                                             "bar")) %>%
+  step_mutate(household_serving_fulltext_brownie = str_detect(household_serving_fulltext,
+                                                             "brownie")) %>%
+  step_mutate(household_serving_fulltext_chip = str_detect(household_serving_fulltext,
+                                                             "chip"))%>%
+  step_mutate(household_serving_fulltext_cookie = str_detect(household_serving_fulltext,
+                                                                                                                  "cookie|cookes|ckooie|cooikes|coookie"))%>%
+  step_mutate(household_serving_fulltext_cracker = str_detect(household_serving_fulltext,
+                                                             "cracker")) %>%
+  step_mutate(household_serving_fulltext_cup = str_detect(household_serving_fulltext,
+                                                             "cup"))%>%
+  step_mutate(household_serving_fulltext_donut = str_detect(household_serving_fulltext,
+                                                             "donut")) %>%
+  step_mutate(household_serving_fulltext_grm = str_detect(household_serving_fulltext,
+                                                             "grm")) %>%
+  step_mutate(household_serving_fulltext_onz = str_detect(household_serving_fulltext,
+                                                             "onz")) %>%
+  step_mutate(household_serving_fulltext_package = str_detect(household_serving_fulltext,
+                                                             "package|pkg|pack")) %>%
+  step_mutate(household_serving_fulltext_piece = str_detect(household_serving_fulltext,
+                                                             "piece|pcs")) %>%
+  step_mutate(household_serving_fulltext_pop = str_detect(household_serving_fulltext,
+                                                             "pop")) %>%
+  step_mutate(household_serving_fulltext_pouch = str_detect(household_serving_fulltext,
+                                                             "pouch")) %>%
+  step_mutate(household_serving_fulltext_pretz = str_detect(household_serving_fulltext,
+                                                             "pretzel|petzels")) %>%
+  step_mutate(household_serving_fulltext_slice = str_detect(household_serving_fulltext,
+                                                             "slice")) %>%
+  step_mutate(household_serving_fulltext_square = str_detect(household_serving_fulltext,
+                                                             "square")) %>%
+  step_mutate(household_serving_fulltext_tbsp = str_detect(household_serving_fulltext,
+                                                             "tbsp")) %>%
+  step_mutate(across(is.logical ,  ~replace_na(.x , 0))) %>% 
+  step_mutate(across(is.numeric ,  ~replace_na(.x , 0))) %>% 
+  step_log(n_word_ing , len_ing , offset = 1) %>% 
+  step_rm(ingredients, brand , description , household_serving_fulltext) %>% 
+  step_mutate_at(has_type(match = "logical") , fn = as.numeric)
+  
+```
+
+* After prepping the recipe on train_train, baking train_train and train_val,
+  and creating 5 folds for the CV i define the models and tuned them:
+
+```{r ,warning=FALSE , include=FALSE}
+rec <- rec %>% prep(train_train)
+train_train <- rec %>% bake(train_train)
+train_val <- rec %>% bake(train_val)
+```
+
+
+```{r , include=FALSE}
+set.seed(77)
+folds <- vfold_cv(train_train , v = 5)
+```
+
+### Multinom regression
+
+```{r}
+set.seed(77)
+multi_mod <- multinom_reg( mode = "classification" , penalty =  tune() ,mixture =   tune() , engine = "glmnet")
+multi_grid <- grid_regular(penalty() , mixture() , levels = 5)
+multi_wf <- workflow() %>% 
+  add_model(multi_mod) %>% 
+  add_formula(category~ . )
+multi_mod_tuning <- multi_wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = multi_grid
+  )
+
+```
+
+### Knn model
+
+```{r}
+set.seed(77)
+knn_mod <- nearest_neighbor( mode = "classification" , neighbors = tune() ,dist_power =  tune() , engine = "kknn")
+knn_grid <- grid_regular(neighbors() , dist_power() , levels = c(10 , 2))
+knn_wf <- workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_formula(category~ . )
+knn_mod_tuning <- knn_wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = knn_grid
+  )
+```
+
+### xgboost model
+
+```{r}
+set.seed(77)
+boost_mod <- boost_tree( mode = "classification" , learn_rate = tune() ,trees = tune()  ,
+                         tree_depth = tune()  , engine = "xgboost")
+boost_grid <- grid_regular(learn_rate() , trees(range = c(1,100)) ,
+                           tree_depth() , levels = c(5,5,4))
+boost_wf <- workflow() %>% 
+  add_model(boost_mod) %>% 
+  add_formula(category~ . )
+boost_mod_tuning <- boost_wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = boost_grid
+  )
+```
+
+### random forest
+
+```{r}
+set.seed(77)
+rand_mod <- rand_forest( mode = "classification" ,trees = tune() , mtry = tune(),
+                         engine = "randomForest")
+rand_grid <- grid_regular(trees(range = c(500,1000)) , mtry(range = c(12,60)) ,
+                          levels = c(3,5))
+rand_wf <- workflow() %>% 
+  add_model(rand_mod) %>% 
+  add_formula(category~ . )
+rand_mod_tuning <- rand_wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = rand_grid
+  )
+```
+
+### best hyper parameters results
+
+```{r,echo=FALSE}
+multi_mod_tuning %>% 
+  show_best("accuracy")
+```
+
+```{r,echo=FALSE}
+knn_mod_tuning %>% 
+  show_best("accuracy")
+```
+
+```{r,echo=FALSE}
+boost_mod_tuning %>% 
+  show_best("accuracy")
+```
+
+```{r,echo=FALSE}
+rand_mod_tuning %>% 
+  show_best("accuracy")
+```
+
+* For multinom regression: penalty = 1.000000e-10	 , mixture = 1
+* For knn model: neighbors = 10 , dist_power = 1
+* For xgboost model: trees = 100 , tree_depth = 10 , learn rate = 0.1
+* For random forest: mtry = 12 , trees = 500.
+
+### Redefining the models with new best HP
+
+```{r}
+final_multi_mod <- multinom_reg(mode = "classification" , penalty = 1.000000e-10	,
+                                mixture = 1 , engine = "glmnet")
+final_knn_mod <- nearest_neighbor(mode = "classification" ,neighbors = 10 ,
+                                  dist_power = 1 , engine = "kknn")
+final_boost_mode <- boost_tree(mode = "classification" , trees = 100 ,
+                               tree_depth = 10 , learn_rate = 0.1 ,
+                               engine = "xgboost")
+final_rand_mode <- rand_forest(mode = "classification" , trees = 500 ,
+                               mtry = 12 , engine = "randomForest")
+```
+
+### Fitting them on the entire train_train data
+
+```{r}
+set.seed(77)
+fit_multi <- fit(final_multi_mod , category~. , data = train_train)
+fit_knn <- fit(final_knn_mod , category~. , data = train_train)
+fit_boost <- fit(final_boost_mode , category~. , data = train_train)
+fit_rand <- fit(final_rand_mode , category ~. , data = train_train)
+```
+
+### Prediction on train_val data
+
+```{r}
+multi_pred <- predict(fit_multi , new_data = train_val)$.pred_class
+knn_pred <- predict(fit_knn , new_data = train_val )$.pred_class
+boost_pred <- predict(fit_boost , new_data = train_val)$.pred_class
+rand_pred <- predict(fit_rand , new_data = train_val)$.pred_class
+```
+
+### Results
+
+```{r , echo=FALSE}
+model <- c("multinom regression" , "knn" , "xgboost" , "random forest")
+
+accuracy_of_model <- c(accuracy_vec(multi_pred ,train_val$category) ,
+                accuracy_vec(knn_pred , train_val$category) ,
+                accuracy_vec(boost_pred , train_val$category) ,
+                accuracy_vec(rand_pred , train_val$category))
+
+tibble(model , accuracy_of_model) %>% 
+  arrange(-accuracy_of_model)
+
+```
+
+* As we can see xgboost and random forest both were better than the other two,
+  but because i doesn't have a clear best model i will make final predictions  
+  with the two of them.
+
+* After redefining the recipe for the entire training data, prepping on it and 
+  baking the training data and test data into final_train_pro and     
+  final_test_pro, i fit xgboost and random forest model on the final_train_pro.
+
+```{r , include=FALSE}
+rec_final <- recipe(category~. , final_train) %>%
+  update_role(idx , new_role = "ID") %>% 
+  step_rm(all_of(cols_NA_for_rec) ,serving_size_unit , red , blue , green) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_mutate(len_ing = str_length(ingredients)) %>% 
+  step_mutate(n_word_ing = str_count(ingredients , "\\w+")) %>%
+  step_mutate(brand_ferrara = str_detect(brand , "ferrara")) %>%
+  step_mutate(brand_walmart = str_detect(brand , "wal-mart")) %>%
+  step_mutate(brand_meijer = str_detect(brand , "meijer"))%>%
+  step_mutate(brand_target = str_detect(brand , "target stores"))%>%
+  step_mutate(brand_lindt = str_detect(brand , "lindt")) %>%
+  step_mutate(brand_russel = str_detect(brand , "russell stores")) %>%
+  step_mutate(brand_quality = str_detect(brand , "quality foods")) %>%
+  step_mutate(brand_frankford = str_detect(brand , "frankford")) %>%
+  step_mutate(brand_not = str_detect(brand , "not a")) %>%
+  step_mutate(brand_nabisco = str_detect(brand , "nabisco")) %>%
+  step_mutate(description_chocolate = str_detect(description , "chocolate")) %>%
+  step_mutate(description_cookie = str_detect(description , "cookie|biscuit")) %>%
+  step_mutate(description_cake = str_detect(description , "cake|cupcake")) %>%
+  step_mutate(description_candy = str_detect(description , "candy"))%>%
+  step_mutate(description_chips = str_detect(description , "chips|pretzel")) %>%
+  step_mutate(description_pop_peanut = str_detect(description , "popcorn|peanut|seed")) %>%
+  step_mutate(ingredients_milk = str_detect(ingredients , "milk"))%>% 
+  step_mutate(ingredients_cocoa = str_detect(ingredients , "cocoa")) %>% 
+  step_mutate(ingredients_chocolate = str_detect(ingredients , "chocolate")) %>% 
+  step_mutate(ingredients_butter = str_detect(ingredients , "butter")) %>% 
+  step_mutate(ingredients_emuls = str_detect(ingredients , "emulsifier")) %>% 
+  step_mutate(ingredients_vanilla = str_detect(ingredients , "vanilla")) %>% 
+  step_mutate(ingredients_wheat = str_detect(ingredients , "wheat")) %>%
+  step_mutate(ingredients_palm = str_detect(ingredients , "palm")) %>%
+  step_mutate(ingredients_syrup = str_detect(ingredients , "syrup")) %>%
+  step_mutate(ingredients_soduim = str_detect(ingredients , "sodium")) %>%
+  step_mutate(ingredients_gum = str_detect(ingredients , "gum")) %>%
+  step_mutate(ingredients_starch = str_detect(ingredients , "starch")) %>%
+  step_mutate(ingredients_water = str_detect(ingredients , "water")) %>%
+  step_mutate(ingredients_yellow = str_detect(ingredients , "yellow")) %>%
+  step_mutate(ingredients_red = str_detect(ingredients , "red"))%>%
+  step_mutate(ingredients_blue = str_detect(ingredients , "blue")) %>%
+  step_mutate(ingredients_citric = str_detect(ingredients , "citric")) %>%
+  step_mutate(ingredients_sunflower = str_detect(ingredients , "sunflower")) %>%
+  step_mutate(ingredients_canola = str_detect(ingredients , "canola")) %>%
+  step_mutate(ingredients_organic = str_detect(ingredients , "organic")) %>%
+  step_mutate(ingredients_veg = str_detect(ingredients , "vegetable")) %>%
+  step_mutate(ingredients_almond = str_detect(ingredients , "almond")) %>%
+  step_mutate(household_serving_fulltext_bag = str_detect(household_serving_fulltext,"bag"))%>%
+  step_mutate(household_serving_fulltext_bar = str_detect(household_serving_fulltext,
+                                                             "bar")) %>%
+  step_mutate(household_serving_fulltext_brownie = str_detect(household_serving_fulltext,
+                                                             "brownie")) %>%
+  step_mutate(household_serving_fulltext_chip = str_detect(household_serving_fulltext,
+                                                             "chip"))%>%
+  step_mutate(household_serving_fulltext_cookie = str_detect(household_serving_fulltext,
+                                                                                                                  "cookie|cookes|ckooie|cooikes|coookie"))%>%
+  step_mutate(household_serving_fulltext_cracker = str_detect(household_serving_fulltext,
+                                                             "cracker")) %>%
+  step_mutate(household_serving_fulltext_cup = str_detect(household_serving_fulltext,
+                                                             "cup"))%>%
+  step_mutate(household_serving_fulltext_donut = str_detect(household_serving_fulltext,
+                                                             "donut")) %>%
+  step_mutate(household_serving_fulltext_grm = str_detect(household_serving_fulltext,
+                                                             "grm")) %>%
+  step_mutate(household_serving_fulltext_onz = str_detect(household_serving_fulltext,
+                                                             "onz")) %>%
+  step_mutate(household_serving_fulltext_package = str_detect(household_serving_fulltext,
+                                                             "package|pkg|pack")) %>%
+  step_mutate(household_serving_fulltext_piece = str_detect(household_serving_fulltext,
+                                                             "piece|pcs")) %>%
+  step_mutate(household_serving_fulltext_pop = str_detect(household_serving_fulltext,
+                                                             "pop")) %>%
+  step_mutate(household_serving_fulltext_pouch = str_detect(household_serving_fulltext,
+                                                             "pouch")) %>%
+  step_mutate(household_serving_fulltext_pretz = str_detect(household_serving_fulltext,
+                                                             "pretzel|petzels")) %>%
+  step_mutate(household_serving_fulltext_slice = str_detect(household_serving_fulltext,
+                                                             "slice")) %>%
+  step_mutate(household_serving_fulltext_square = str_detect(household_serving_fulltext,
+                                                             "square")) %>%
+  step_mutate(household_serving_fulltext_tbsp = str_detect(household_serving_fulltext,
+                                                             "tbsp")) %>%
+  step_mutate(across(is.logical ,  ~replace_na(.x , 0))) %>% 
+  step_mutate(across(is.numeric ,  ~replace_na(.x , 0))) %>% 
+  step_log(n_word_ing , len_ing , offset = 1) %>% 
+  step_rm(ingredients, brand , description , household_serving_fulltext) %>% 
+  step_mutate_at(has_type(match = "logical") , fn = as.numeric)
+```
+
+```{r,warning=FALSE , include=FALSE}
+rec_final <- rec_final %>% prep(final_train)
+final_train_pro <- rec_final %>% bake(final_train)
+final_test_pro <- rec_final %>% bake(final_test)
+```
+
+```{r}
+fit_boost <- fit(final_boost_mode , category~. , data = final_train_pro)
+fit_rand <- fit(final_rand_mode , category ~. , data = final_train_pro)
+```
+
+### Final predictions
+
+```{r}
+pred_cat_xg <- predict(fit_boost , new_data = final_test_pro)$.pred_class
+cate_df_xg <- final_test_pro %>% 
+  select(idx)
+cate_df_xg$pred_cat <- pred_cat_xg
+
+write_csv(cate_df_xg , "model01.csv")
+```
+
+
+```{r}
+pred_cat_rf <- predict(fit_rand , new_data = final_test_pro)$.pred_class
+cate_df_rf <- final_test_pro %>% 
+  select(idx)
+cate_df_rf$pred_cat <- pred_cat_rf
+
+write_csv(cate_df_rf , "model02.csv")
+```
+
+### Notes on DL
+
+* Unfortunately CNN models and DNN models on the image data and
+  tabular data yielded worst results than the previous models, and thats 
+  including mixed inputs models with concatenation layers, and model for each 
+  data individually, and includes many many tries :( .
+
+
+
+
+
+
+
+
+
+
+
+
